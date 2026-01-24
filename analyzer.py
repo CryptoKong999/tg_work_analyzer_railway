@@ -1,9 +1,6 @@
 """
-Telegram Work Analyzer
-Анализирует чаты за последний месяц и генерирует:
-- SOP документы для делегирования
-- Рекомендации по оптимизации
-- Метрики использования времени
+Telegram Work Analyzer — Railway Edition
+Анализирует чаты за последний месяц и отправляет отчёт через бота
 """
 
 import asyncio
@@ -13,13 +10,18 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from telethon import TelegramClient
 from telethon.tl.types import User, Chat, Channel
+from telethon.sessions import StringSession
 import anthropic
+import httpx
 
 # === КОНФИГУРАЦИЯ ===
-API_ID = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-SESSION_NAME = "work_analyzer_session"
+# Используем твои имена переменных
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")  # Твоя переменная
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+CHAT_ID = os.getenv("MY_USER_ID", "")  # Твоя переменная
 
 # Период анализа
 DAYS_TO_ANALYZE = 30
@@ -31,7 +33,18 @@ MAX_CHATS = 50
 
 class TelegramWorkAnalyzer:
     def __init__(self):
-        self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+        # Проверяем что все переменные есть
+        if not API_ID or not API_HASH:
+            raise ValueError("TELEGRAM_API_ID и TELEGRAM_API_HASH обязательны!")
+        if not SESSION_STRING:
+            raise ValueError("SESSION_STRING обязателен!")
+        
+        # Используем StringSession для serverless
+        self.client = TelegramClient(
+            StringSession(SESSION_STRING), 
+            API_ID, 
+            API_HASH
+        )
         self.anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.my_id = None
         self.data = {
@@ -42,7 +55,12 @@ class TelegramWorkAnalyzer:
     
     async def connect(self):
         """Подключение к Telegram"""
-        await self.client.start()
+        # connect() вместо start() — сессия уже авторизована
+        await self.client.connect()
+        
+        if not await self.client.is_user_authorized():
+            raise ValueError("Session string невалидный! Перегенерируй через generate_session.py")
+        
         me = await self.client.get_me()
         self.my_id = me.id
         print(f"✅ Подключен как: {me.first_name} (@{me.username})")
@@ -60,39 +78,42 @@ class TelegramWorkAnalyzer:
             chat_name = self._get_chat_name(entity)
             chat_type = self._get_chat_type(entity)
             
-            # Пропускаем ботов и каналы без комментариев
             if chat_type == "bot":
                 continue
             
-            print(f"  📂 {chat_name} ({chat_type})...", end=" ")
+            print(f"  📂 {chat_name} ({chat_type})...", end=" ", flush=True)
             
             messages = []
             my_messages_count = 0
             
-            async for msg in self.client.iter_messages(
-                entity, 
-                limit=MAX_MESSAGES_PER_CHAT,
-                offset_date=datetime.now()
-            ):
-                if msg.date.replace(tzinfo=None) < cutoff_date:
-                    break
-                
-                if msg.text:
-                    msg_data = {
-                        "date": msg.date.isoformat(),
-                        "text": msg.text[:1000],  # Обрезаем длинные
-                        "is_mine": msg.sender_id == self.my_id,
-                        "hour": msg.date.hour
-                    }
-                    messages.append(msg_data)
+            try:
+                async for msg in self.client.iter_messages(
+                    entity, 
+                    limit=MAX_MESSAGES_PER_CHAT,
+                    offset_date=datetime.now()
+                ):
+                    if msg.date.replace(tzinfo=None) < cutoff_date:
+                        break
                     
-                    if msg.sender_id == self.my_id:
-                        my_messages_count += 1
-                        self.data["my_messages"].append({
-                            "chat": chat_name,
-                            "chat_type": chat_type,
-                            **msg_data
-                        })
+                    if msg.text:
+                        msg_data = {
+                            "date": msg.date.isoformat(),
+                            "text": msg.text[:1000],
+                            "is_mine": msg.sender_id == self.my_id,
+                            "hour": msg.date.hour
+                        }
+                        messages.append(msg_data)
+                        
+                        if msg.sender_id == self.my_id:
+                            my_messages_count += 1
+                            self.data["my_messages"].append({
+                                "chat": chat_name,
+                                "chat_type": chat_type,
+                                **msg_data
+                            })
+            except Exception as e:
+                print(f"ошибка: {e}")
+                continue
             
             if messages:
                 self.data["chats"][chat_name] = {
@@ -109,7 +130,6 @@ class TelegramWorkAnalyzer:
         print(f"\n✅ Собрано: {len(self.data['my_messages'])} твоих сообщений в {len(self.data['chats'])} чатах")
     
     def _get_chat_name(self, entity):
-        """Получить название чата"""
         if isinstance(entity, User):
             name = entity.first_name or ""
             if entity.last_name:
@@ -118,7 +138,6 @@ class TelegramWorkAnalyzer:
         return getattr(entity, 'title', f"Chat_{entity.id}")
     
     def _get_chat_type(self, entity):
-        """Определить тип чата"""
         if isinstance(entity, User):
             if entity.bot:
                 return "bot"
@@ -132,7 +151,6 @@ class TelegramWorkAnalyzer:
         return "unknown"
     
     def _calculate_stats(self):
-        """Подсчёт базовой статистики"""
         stats = self.data["stats"]
         
         for msg in self.data["my_messages"]:
@@ -140,7 +158,6 @@ class TelegramWorkAnalyzer:
             stats[f"type_{msg['chat_type']}"] += 1
             stats[f"hour_{msg['hour']}"] += 1
         
-        # Топ чатов по моей активности
         chat_activity = {}
         for chat_name, chat_data in self.data["chats"].items():
             chat_activity[chat_name] = chat_data["my_messages"]
@@ -153,7 +170,6 @@ class TelegramWorkAnalyzer:
         """Анализ через Claude API"""
         print("\n🧠 Анализирую с помощью Claude...")
         
-        # Подготовка данных для анализа
         analysis_data = self._prepare_analysis_data()
         
         prompt = f"""Ты — эксперт по продуктивности и бизнес-процессам. 
@@ -254,7 +270,6 @@ class TelegramWorkAnalyzer:
         return self._parse_claude_response(response.content[0].text)
     
     def _prepare_analysis_data(self):
-        """Подготовка данных для Claude"""
         result = []
         
         for chat_name, chat_data in self.data["chats"].items():
@@ -262,7 +277,6 @@ class TelegramWorkAnalyzer:
             if not my_msgs:
                 continue
             
-            # Берём sample сообщений
             sample = my_msgs[:30] if len(my_msgs) > 30 else my_msgs
             
             result.append(f"\n### {chat_name} ({chat_data['type']}) — {len(my_msgs)} сообщений")
@@ -270,10 +284,9 @@ class TelegramWorkAnalyzer:
                 date = msg["date"][:10]
                 result.append(f"[{date}] {msg['text'][:200]}")
         
-        return "\n".join(result)[:50000]  # Лимит контекста
+        return "\n".join(result)[:50000]
     
     def _format_hourly_stats(self):
-        """Форматирование статистики по часам"""
         hours = {}
         for key, value in self.data["stats"].items():
             if key.startswith("hour_"):
@@ -288,9 +301,7 @@ class TelegramWorkAnalyzer:
         return "\n".join(result)
     
     def _parse_claude_response(self, text):
-        """Извлечение JSON из ответа Claude"""
         try:
-            # Ищем JSON блок
             start = text.find("{")
             end = text.rfind("}") + 1
             if start != -1 and end > start:
@@ -300,263 +311,227 @@ class TelegramWorkAnalyzer:
         
         return {"raw_response": text}
     
-    def generate_reports(self, analysis):
-        """Генерация отчётов"""
-        print("\n📝 Генерирую отчёты...")
+    def format_telegram_report(self, analysis):
+        """Форматирование отчёта для Telegram"""
         
-        # 1. Основной отчёт
-        self._save_main_report(analysis)
-        
-        # 2. SOP документы
-        self._save_sop_documents(analysis)
-        
-        # 3. Action план
-        self._save_action_plan(analysis)
-        
-        # 4. Сырые данные
-        self._save_raw_data()
-        
-        print("\n✅ Отчёты сохранены в папку 'reports/'")
-    
-    def _save_main_report(self, analysis):
-        """Главный отчёт в Markdown"""
-        os.makedirs("reports", exist_ok=True)
-        
-        report = f"""# 📊 Анализ рабочей коммуникации
-**Период:** {DAYS_TO_ANALYZE} дней
-**Дата отчёта:** {datetime.now().strftime('%d.%m.%Y %H:%M')}
-
----
-
-## 📋 Резюме
+        # Главное сообщение
+        main_report = f"""📊 <b>АНАЛИЗ КОММУНИКАЦИИ</b>
+<i>Период: {DAYS_TO_ANALYZE} дней</i>
 
 {analysis.get('executive_summary', 'Нет данных')}
 
----
+━━━━━━━━━━━━━━━
 
-## ⏰ Анализ времени
+📈 <b>СТАТИСТИКА</b>
+• Всего сообщений: <code>{self.data['stats']['total_my_messages']}</code>
+• Личные чаты: <code>{self.data['stats'].get('type_personal', 0)}</code>
+• Группы: <code>{self.data['stats'].get('type_group', 0) + self.data['stats'].get('type_supergroup', 0)}</code>
 
-### Пиковые часы активности
-{self._format_list(analysis.get('time_analysis', {}).get('peak_hours', []))}
+━━━━━━━━━━━━━━━
 
-### Паттерны потери времени
-{self._format_list(analysis.get('time_analysis', {}).get('wasted_time_patterns', []))}
+⏰ <b>ВРЕМЯ</b>
+Пики: {', '.join(analysis.get('time_analysis', {}).get('peak_hours', ['N/A'])[:3])}
 
-### Рекомендации
-{self._format_list(analysis.get('time_analysis', {}).get('recommendations', []))}
+Потери времени:
+{self._format_tg_list(analysis.get('time_analysis', {}).get('wasted_time_patterns', [])[:3])}
 
----
+━━━━━━━━━━━━━━━
 
-## 🎯 Возможности для делегирования
-
-{self._format_delegation_table(analysis.get('delegation_opportunities', []))}
-
----
-
-## 💬 Паттерны коммуникации
-
-### Повторяющиеся объяснения (нужна документация)
-{self._format_list(analysis.get('communication_patterns', {}).get('repetitive_explanations', []))}
-
-### Узкие места (где застревают процессы)
-{self._format_list(analysis.get('communication_patterns', {}).get('bottlenecks', []))}
-
-### Как улучшить
-{self._format_list(analysis.get('communication_patterns', {}).get('improvements', []))}
-
----
-
-## 🤖 Идеи автоматизации
-
-{self._format_automation_table(analysis.get('automation_ideas', []))}
-
----
-
-## 📈 Метрики
-
-| Метрика | Значение |
-|---------|----------|
-| Операционка vs Стратегия | {analysis.get('metrics', {}).get('operational_vs_strategic', 'N/A')} |
-| Время ответа | {analysis.get('metrics', {}).get('response_time_estimate', 'N/A')} |
-| Переключение контекста | {analysis.get('metrics', {}).get('context_switching', 'N/A')} |
-
----
-
-## 📊 Статистика из данных
-
-- **Всего сообщений:** {self.data['stats']['total_my_messages']}
-- **Личные чаты:** {self.data['stats'].get('type_personal', 0)}
-- **Группы:** {self.data['stats'].get('type_group', 0) + self.data['stats'].get('type_supergroup', 0)}
-
-### Топ-10 чатов по активности
-{self._format_top_chats()}
-
-### Распределение по часам
-```
-{self._format_hourly_stats()}
-```
+📊 <b>МЕТРИКИ</b>
+• Операционка/Стратегия: {analysis.get('metrics', {}).get('operational_vs_strategic', 'N/A')}
+• Переключение контекста: {analysis.get('metrics', {}).get('context_switching', 'N/A')}
 """
-        
-        with open("reports/main_report.md", "w", encoding="utf-8") as f:
-            f.write(report)
-        
-        print("  ✓ reports/main_report.md")
-    
-    def _save_sop_documents(self, analysis):
-        """Отдельные SOP документы"""
-        sops = analysis.get("sop_candidates", [])
-        
-        if not sops:
-            return
-        
-        os.makedirs("reports/sops", exist_ok=True)
-        
-        for i, sop in enumerate(sops, 1):
-            filename = f"reports/sops/SOP_{i:02d}_{self._slugify(sop.get('process_name', 'process'))}.md"
-            
-            content = f"""# SOP: {sop.get('process_name', 'Без названия')}
 
-## Описание
+        # Делегирование
+        delegation = analysis.get('delegation_opportunities', [])
+        delegation_msg = "🎯 <b>ДЕЛЕГИРОВАТЬ</b>\n\n"
+        for item in delegation[:5]:
+            priority_emoji = {"high": "🔴", "medium": "🟡", "low": "🟢"}.get(item.get('priority', ''), "⚪")
+            delegation_msg += f"{priority_emoji} <b>{item.get('task', '')}</b>\n"
+            delegation_msg += f"   → {item.get('can_delegate_to', 'не указано')}\n"
+            delegation_msg += f"   ⏱ {item.get('current_time_spent', '')}\n\n"
+
+        # SOP документы
+        sops = analysis.get('sop_candidates', [])
+        sop_messages = []
+        for i, sop in enumerate(sops[:5], 1):
+            sop_msg = f"""📋 <b>SOP #{i}: {sop.get('process_name', 'Процесс')}</b>
+
 {sop.get('description', '')}
 
-## Триггер
-{sop.get('triggers', 'Не указан')}
+<b>Триггер:</b> {sop.get('triggers', 'не указан')}
+<b>Владелец:</b> {sop.get('owner', 'не назначен')}
 
-## Ответственный
-{sop.get('owner', 'Не назначен')}
+<b>Шаги:</b>
+{self._format_tg_numbered(sop.get('steps', []))}
 
-## Необходимые инструменты
-{self._format_list(sop.get('tools_needed', []))}
-
-## Шаги выполнения
-
-{self._format_numbered_list(sop.get('steps', []))}
-
----
-*Создано автоматически: {datetime.now().strftime('%d.%m.%Y')}*
+<b>Инструменты:</b> {', '.join(sop.get('tools_needed', []))}
 """
-            
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(content)
-            
-            print(f"  ✓ {filename}")
-    
-    def _save_action_plan(self, analysis):
-        """Action план"""
-        actions = analysis.get("action_plan", [])
-        
-        content = f"""# 🎯 Action Plan
-**Дата:** {datetime.now().strftime('%d.%m.%Y')}
+            sop_messages.append(sop_msg)
 
----
+        # Action план
+        actions = analysis.get('action_plan', [])
+        action_msg = "🚀 <b>ACTION PLAN</b>\n\n"
+        for item in actions[:7]:
+            action_msg += f"<b>[{item.get('priority', '?')}]</b> {item.get('action', '')}\n"
+            action_msg += f"    <i>→ {item.get('expected_result', '')}</i>\n\n"
 
-"""
-        for action in actions:
-            priority = action.get("priority", "?")
-            content += f"""## [{priority}] {action.get('action', 'Действие')}
+        # Автоматизация
+        automation = analysis.get('automation_ideas', [])
+        auto_msg = "🤖 <b>АВТОМАТИЗИРОВАТЬ</b>\n\n"
+        for item in automation[:5]:
+            impact_emoji = {"high": "🔥", "medium": "⚡", "low": "💡"}.get(item.get('impact', ''), "💡")
+            auto_msg += f"{impact_emoji} <b>{item.get('idea', '')}</b>\n"
+            auto_msg += f"   <i>{item.get('implementation', '')}</i>\n\n"
 
-**Ожидаемый результат:** {action.get('expected_result', 'Не указан')}
+        # Топ чатов
+        top_chats = self.data['stats'].get('top_chats', {})
+        top_msg = "💬 <b>ТОП-10 ЧАТОВ</b>\n\n"
+        for name, count in list(top_chats.items())[:10]:
+            top_msg += f"• <b>{name}</b>: {count}\n"
 
----
-
-"""
-        
-        with open("reports/action_plan.md", "w", encoding="utf-8") as f:
-            f.write(content)
-        
-        print("  ✓ reports/action_plan.md")
-    
-    def _save_raw_data(self):
-        """Сохранение сырых данных"""
-        # Статистика без полных сообщений
-        stats_only = {
-            "stats": dict(self.data["stats"]),
-            "chats_summary": {
-                name: {
-                    "type": data["type"],
-                    "total": data["total_messages"],
-                    "mine": data["my_messages"]
-                }
-                for name, data in self.data["chats"].items()
-            }
+        return {
+            "main": main_report,
+            "delegation": delegation_msg,
+            "sops": sop_messages,
+            "actions": action_msg,
+            "automation": auto_msg,
+            "top_chats": top_msg
         }
-        
-        with open("reports/stats.json", "w", encoding="utf-8") as f:
-            json.dump(stats_only, f, ensure_ascii=False, indent=2)
-        
-        print("  ✓ reports/stats.json")
     
-    # === Helpers ===
-    
-    def _format_list(self, items):
+    def _format_tg_list(self, items):
         if not items:
-            return "*Нет данных*"
-        return "\n".join(f"- {item}" for item in items)
+            return "• Нет данных"
+        return "\n".join(f"• {item}" for item in items)
     
-    def _format_numbered_list(self, items):
+    def _format_tg_numbered(self, items):
         if not items:
-            return "*Нет шагов*"
+            return "Нет шагов"
         return "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
     
-    def _format_delegation_table(self, items):
-        if not items:
-            return "*Нет данных*"
+    async def send_via_bot(self, reports):
+        """Отправка отчётов через бота"""
+        print("\n📤 Отправляю отчёты через бота...")
         
-        result = "| Задача | Время | Кому делегировать | Приоритет |\n"
-        result += "|--------|-------|-------------------|------------|\n"
+        if not BOT_TOKEN or not CHAT_ID:
+            print("⚠️ BOT_TOKEN или CHAT_ID не указаны — пропускаю отправку")
+            return
         
-        for item in items:
-            result += f"| {item.get('task', '')} | {item.get('current_time_spent', '')} | {item.get('can_delegate_to', '')} | {item.get('priority', '')} |\n"
+        base_url = f"https://api.telegram.org/bot{BOT_TOKEN}"
         
-        return result
-    
-    def _format_automation_table(self, items):
-        if not items:
-            return "*Нет идей*"
+        async with httpx.AsyncClient() as client:
+            # Отправляем сообщения последовательно
+            messages_to_send = [
+                ("📊 Главный отчёт", reports["main"]),
+                ("🎯 Делегирование", reports["delegation"]),
+                ("🚀 Action Plan", reports["actions"]),
+                ("🤖 Автоматизация", reports["automation"]),
+                ("💬 Топ чатов", reports["top_chats"]),
+            ]
+            
+            for title, text in messages_to_send:
+                try:
+                    resp = await client.post(
+                        f"{base_url}/sendMessage",
+                        json={
+                            "chat_id": CHAT_ID,
+                            "text": text[:4096],
+                            "parse_mode": "HTML"
+                        }
+                    )
+                    if resp.status_code == 200:
+                        print(f"  ✓ {title}")
+                    else:
+                        print(f"  ✗ {title}: {resp.text}")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"  ✗ {title}: {e}")
+            
+            # Отправляем SOP документы
+            for i, sop_text in enumerate(reports["sops"], 1):
+                try:
+                    resp = await client.post(
+                        f"{base_url}/sendMessage",
+                        json={
+                            "chat_id": CHAT_ID,
+                            "text": sop_text[:4096],
+                            "parse_mode": "HTML"
+                        }
+                    )
+                    if resp.status_code == 200:
+                        print(f"  ✓ SOP #{i}")
+                    else:
+                        print(f"  ✗ SOP #{i}: {resp.text}")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"  ✗ SOP #{i}: {e}")
+            
+            # Финальное сообщение
+            await client.post(
+                f"{base_url}/sendMessage",
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": f"✅ <b>Анализ завершён</b>\n\n<i>{datetime.now().strftime('%d.%m.%Y %H:%M')}</i>",
+                    "parse_mode": "HTML"
+                }
+            )
         
-        result = "| Идея | Импакт | Реализация |\n"
-        result += "|------|--------|------------|\n"
-        
-        for item in items:
-            result += f"| {item.get('idea', '')} | {item.get('impact', '')} | {item.get('implementation', '')} |\n"
-        
-        return result
-    
-    def _format_top_chats(self):
-        top = self.data["stats"].get("top_chats", {})
-        return "\n".join(f"- **{name}**: {count} сообщений" for name, count in top.items())
-    
-    def _slugify(self, text):
-        import re
-        text = text.lower().strip()
-        text = re.sub(r'[^\w\s-]', '', text)
-        text = re.sub(r'[\s_-]+', '_', text)
-        return text[:50]
+        print("✅ Все отчёты отправлены!")
     
     async def run(self):
         """Основной запуск"""
         print("=" * 50)
         print("🔍 TELEGRAM WORK ANALYZER")
+        print(f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         print("=" * 50)
         
-        await self.connect()
-        await self.collect_messages()
-        
-        analysis = self.analyze_with_claude()
-        self.generate_reports(analysis)
-        
-        # Сохраняем полный анализ
-        with open("reports/full_analysis.json", "w", encoding="utf-8") as f:
-            json.dump(analysis, f, ensure_ascii=False, indent=2)
-        
-        print("\n" + "=" * 50)
-        print("✅ ГОТОВО!")
-        print("=" * 50)
-        print("\nОткрой reports/main_report.md для полного отчёта")
-        print("SOP документы в reports/sops/")
+        try:
+            await self.connect()
+            await self.collect_messages()
+            
+            if self.data['stats']['total_my_messages'] == 0:
+                print("⚠️ Нет сообщений для анализа")
+                return
+            
+            analysis = self.analyze_with_claude()
+            reports = self.format_telegram_report(analysis)
+            await self.send_via_bot(reports)
+            
+            print("\n" + "=" * 50)
+            print("✅ ГОТОВО!")
+            print("=" * 50)
+            
+        except Exception as e:
+            print(f"\n❌ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Отправляем уведомление об ошибке
+            if BOT_TOKEN and CHAT_ID:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": CHAT_ID,
+                            "text": f"❌ <b>Ошибка анализатора</b>\n\n<code>{str(e)[:500]}</code>",
+                            "parse_mode": "HTML"
+                        }
+                    )
+        finally:
+            await self.client.disconnect()
 
 
 async def main():
+    # Проверяем переменные перед запуском
+    print("Проверяю конфигурацию...")
+    print(f"  API_ID: {'✓' if API_ID else '✗'}")
+    print(f"  API_HASH: {'✓' if API_HASH else '✗'}")
+    print(f"  SESSION_STRING: {'✓' if SESSION_STRING else '✗'} ({len(SESSION_STRING)} chars)")
+    print(f"  ANTHROPIC_API_KEY: {'✓' if ANTHROPIC_API_KEY else '✗'}")
+    print(f"  BOT_TOKEN: {'✓' if BOT_TOKEN else '✗'}")
+    print(f"  CHAT_ID: {'✓' if CHAT_ID else '✗'}")
+    print()
+    
     analyzer = TelegramWorkAnalyzer()
     await analyzer.run()
 
